@@ -86,7 +86,11 @@ public final class MLXVACEPackage: ModelPackage {
         } else {
             directory = try await WeightLoader.snapshotDownload(repoID: configuration.repo)
         }
-        pipeline = try await VACEPipeline.fromPretrained(modelDir: directory)
+        // E15 experiment hook: `VACE_DIT_DTYPE=bf16` runs the bf16-fused attention path
+        // (pair with `WAN_FP32_SDPA=0`); default fp32. No rebuild needed to flip configs.
+        let ditDType: DType =
+            ProcessInfo.processInfo.environment["VACE_DIT_DTYPE"] == "bf16" ? .bfloat16 : .float32
+        pipeline = try await VACEPipeline.fromPretrained(modelDir: directory, ditDType: ditDType)
     }
 
     public func unload() async {

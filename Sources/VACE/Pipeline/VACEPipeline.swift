@@ -88,9 +88,9 @@ public final class VACEPipeline: @unchecked Sendable {
         var weights = try WeightLoader.loadSafetensors(
             url: modelDir.appendingPathComponent("model.safetensors"))
         weights = weights.filter { $0.key != "freqs" }
-        if ditDType == .float32 {
-            weights = weights.mapValues { $0.asType(.float32) }
-        }
+        // Cast to the requested compute dtype (fp32 default; .bfloat16 for the E15 bf16-fused
+        // experiment — mirrors mlx-video, which runs the DiT in bf16 with fp32-internal softmax).
+        weights = weights.mapValues { $0.asType(ditDType) }
         WeightLoader.materialize(weights)
         try model.update(
             parameters: ModuleParameters.unflattened(weights), verify: [.noUnusedKeys])
