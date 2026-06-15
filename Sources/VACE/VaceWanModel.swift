@@ -47,13 +47,21 @@ public final class VaceWanModel: WanModel {
     ) -> [Int: MLXArray] {
         var c = vacePatchify(vaceContext[0])
         var residuals: [Int: MLXArray] = [:]
+        // At large seqLen the per-block self-attention runs in fp32 (see `wanLargeSeq`),
+        // so the 15-block branch + its accumulated hints would build ONE unbounded fp32
+        // lazy graph and materialize all at once — the E15 pathology (107 GB / 44 min @
+        // 480p). `eval` each block to BOUND the graph, exactly as `WanModel.runBlocks`
+        // does for the main blocks; only the small (≤15) concrete hint tensors stay live.
+        let evalEachBlock = state.x.dim(1) >= wanLargeSeq
         for (k, block) in vaceBlocks.enumerated() {
             let (newC, hint) = block.vaceForward(
                 c, x: state.x, e: state.e0, seqLens: state.seqLensList,
                 gridSizes: state.gridSizes, freqs: freqs, context: state.contextBatch,
                 attnMask: state.attnMask)
             c = newC
-            residuals[vaceLayers[k]] = hint * scale
+            let r = hint * scale
+            residuals[vaceLayers[k]] = r
+            if evalEachBlock { eval(c, r) }
         }
         return residuals
     }

@@ -177,8 +177,18 @@ public final class VACEPipeline: @unchecked Sendable {
 
     /// Decode a channels-first DiT latent `[C, Tl, Hl, Wl]` → frames `[1, 3, T', H', W']`
     /// in [-1, 1]. The 16-ch WanVAE decode runs on the CPU stream (fp32 parity / watchdog).
+    ///
+    /// Caps the Metal buffer cache during decode (the TI2V-5B lever, ti2v `c98cdc6`): without
+    /// it the freed full-res conv intermediates accumulate into the phys high-water; a bounded
+    /// cache reclaims them on the next allocation so phys collapses toward the active set. Env
+    /// `DECODE_CACHE_MB` overrides (0 = max reclaim). Scoped to the decode, restored after.
     public func decodeLatent(_ latent: MLXArray) -> MLXArray {
-        Device.withDefaultDevice(.cpu) {
+        let prevCacheLimit = Memory.cacheLimit
+        let capMB = ProcessInfo.processInfo.environment["DECODE_CACHE_MB"].flatMap { Int($0) } ?? 2048
+        Memory.cacheLimit = capMB * 1_000_000
+        defer { Memory.cacheLimit = prevCacheLimit }
+        MLX.GPU.clearCache()  // drop the denoise cache before the capped decode begins
+        return Device.withDefaultDevice(.cpu) {
             let video = vae.decode(latent.expandedDimensions(axis: 0))  // [1, 3, T', H', W']
             eval(video)
             return video
