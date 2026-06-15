@@ -44,11 +44,16 @@ public enum VaceVCU {
         // un-eval'd, build one giant graph (the lazy-graph signature in a path the denoise per-block
         // eval never covered). `eval` + `clearCache` each encode so the inactive working set frees
         // before the reactive one (the pipeline also caps the cache around this whole block).
+        // `encodeStreaming` (the decodeStreaming analog, wan-core) evals each temporal chunk's
+        // full-res forward before the next, so the live working set is ONE chunk — not the whole
+        // sequence — and the cap no longer thrashes a multi-chunk graph (E15 Addendum 8: the cure
+        // for the ~41 GB live + glacial encode). Bit-identical to `vae.encode`. clearCache between
+        // the two so inactive fully releases before reactive.
         vaceMemLog("VCU: pre inactive-encode")
-        let zIn = vae.encode(inactive.expandedDimensions(axis: 0))[0]  // [16, Tl, Hl, Wl]
+        let zIn = encodeStreaming(vae: vae, inactive.expandedDimensions(axis: 0))[0]  // [16, Tl, Hl, Wl]
         eval(zIn); MLX.GPU.clearCache()
         vaceMemLog("VCU: inactive encoded")
-        let zRe = vae.encode(reactive.expandedDimensions(axis: 0))[0]  // [16, Tl, Hl, Wl]
+        let zRe = encodeStreaming(vae: vae, reactive.expandedDimensions(axis: 0))[0]  // [16, Tl, Hl, Wl]
         eval(zRe); MLX.GPU.clearCache()
         vaceMemLog("VCU: reactive encoded")
         return concatenated([zIn, zRe], axis: 0)         // [32, Tl, Hl, Wl]
