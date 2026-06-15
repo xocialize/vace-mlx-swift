@@ -1,0 +1,222 @@
+// VACEPipeline — the all-in-one entry for Wan2.1-VACE-1.3B. Owns the component
+// loads (the VACE Context-Adapter DiT + 16-ch WanVAE + umT5 tokenizer) and the
+// (prompt + condition frames + mask) → frames path. VACE is unified by the VCU
+// mechanism: every mode (inpaint / i2v / flf2v / v2v / depth-pose control) is just
+// a different way to construct the (frames, mask) pair — the pipeline body is the
+// same. umT5 is paged in per request and evicted before denoise (the §2.4 lever) —
+// the consumer-tier (16 GB) memory recipe; the 1.3B DiT + light 16-ch VAE stay
+// resident (no halo-tiling needed at this tier).
+//
+// The whole body composes parity-locked pieces: VaceVCU.buildVCU (WanVAE.encode
+// 3e-6 + mask space-to-depth <1e-6), denoiseVACE (bit-exact forward + wan-core
+// FlowUniPC), WanVAE.decode. Correct by construction.
+
+import Foundation
+import MLX
+import MLXNN
+import MLXRandom
+import Tokenizers
+import WanCore
+
+public final class VACEPipeline: @unchecked Sendable {
+    public let config: WanConfig
+    /// The VACE Context-Adapter DiT (`VaceWanModel`): the wan-core backbone + the
+    /// 15-layer parallel branch. Held resident (1.3B fp32 ≈ 8 GB — fits the tier).
+    public let model: VaceWanModel
+    /// 16-ch WanVAE — encode (condition frames → z0) and decode (latent → frames).
+    public let vae: WanVAE
+    /// Checkpoint dir — kept so umT5 can be (re)loaded per request and evicted
+    /// before denoise (§2.4), rather than held resident.
+    public let modelDir: URL
+    public let tokenizer: any Tokenizer
+    public let vaceLayers: [Int]
+
+    public init(
+        config: WanConfig, model: VaceWanModel, vae: WanVAE,
+        modelDir: URL, tokenizer: any Tokenizer, vaceLayers: [Int]
+    ) {
+        self.config = config
+        self.model = model
+        self.vae = vae
+        self.modelDir = modelDir
+        self.tokenizer = tokenizer
+        self.vaceLayers = vaceLayers
+    }
+
+    /// Load all components from a converted checkpoint directory (flat layout:
+    /// `model.safetensors` (backbone + vace_* branch) + `vae.safetensors` +
+    /// `t5_encoder.safetensors` + `config.json`). Tokenizer from google/umt5-xxl.
+    /// - ditDType: DiT compute precision. Defaults to **fp32** — the video-scale
+    ///   (large-seqLen) correctness path (Metal bf16 attention is unstable over long
+    ///   sequences); the converted weights are fp32. Ignored for quantized checkpoints.
+    public static func fromPretrained(
+        modelDir: URL, ditDType: DType = .float32
+    ) async throws -> VACEPipeline {
+        let config = try WanConfig.load(
+            from: modelDir.appendingPathComponent("config.json"))
+        // vace_layers = every other backbone layer ([0,2,…,28] for 30L = 15 injection points);
+        // vace_in_dim 96 = the VCU width. (Not in the reused backbone config.json — derived,
+        // matching the oracle + the parity tests.)
+        let vaceLayers = Array(stride(from: 0, to: config.numLayers, by: 2))
+
+        let model = try loadDiT(
+            modelDir: modelDir, config: config, vaceLayers: vaceLayers, ditDType: ditDType)
+
+        // 16-ch WanVAE (encoder + decoder), fp32 on the CPU stream (parity + watchdog).
+        let vae = WanVAE(zDim: config.vaeZDim, encoder: true)
+        let vaeWeights = try Device.withDefaultDevice(.cpu) {
+            let loaded = try MLX.loadArrays(
+                url: modelDir.appendingPathComponent("vae.safetensors"))
+            WeightLoader.materialize(loaded)
+            return loaded
+        }
+        try vae.update(
+            parameters: ModuleParameters.unflattened(vaeWeights), verify: [.noUnusedKeys])
+
+        let tokenizer = try await AutoTokenizer.from(pretrained: umt5TokenizerRepo)
+        return VACEPipeline(
+            config: config, model: model, vae: vae,
+            modelDir: modelDir, tokenizer: tokenizer, vaceLayers: vaceLayers)
+    }
+
+    /// Build + load the VACE DiT (fp32 compute for video-scale correctness). Drops a
+    /// stray `freqs` table if present (the precomputed RoPE table is rebuilt in-model).
+    static func loadDiT(
+        modelDir: URL, config: WanConfig, vaceLayers: [Int], ditDType: DType
+    ) throws -> VaceWanModel {
+        let model = VaceWanModel(config: config, vaceLayers: vaceLayers, vaceInDim: 96)
+        var weights = try WeightLoader.loadSafetensors(
+            url: modelDir.appendingPathComponent("model.safetensors"))
+        weights = weights.filter { $0.key != "freqs" }
+        if ditDType == .float32 {
+            weights = weights.mapValues { $0.asType(.float32) }
+        }
+        WeightLoader.materialize(weights)
+        try model.update(
+            parameters: ModuleParameters.unflattened(weights), verify: [.noUnusedKeys])
+        eval(model.parameters())
+        return model
+    }
+
+    // MARK: - umT5 (§2.4 post-encode eviction)
+
+    private func loadTextEncoder() throws -> UMT5EncoderModel {
+        let textEncoder = UMT5EncoderModel.fromConfig(config)
+        let t5Weights = try WeightLoader.loadVerifiedSafetensors(
+            url: modelDir.appendingPathComponent("t5_encoder.safetensors"),
+            expectedKeys: BerniniWeightKeys.t5Keys(layers: config.t5NumLayers)
+        ).mapValues { $0.asType(.float32) }
+        WeightLoader.materialize(t5Weights)
+        try textEncoder.update(
+            parameters: ModuleParameters.unflattened(t5Weights), verify: [.noUnusedKeys])
+        return textEncoder
+    }
+
+    /// §2.4: load umT5, run `body` to produce its text contexts, drop the encoder and
+    /// reclaim its working set before returning. ⚠️ `body` MUST `eval` everything it returns.
+    func withTextEncoder<R>(_ body: (UMT5EncoderModel) throws -> R) throws -> R {
+        var encoder: UMT5EncoderModel? = try loadTextEncoder()
+        let result = try body(encoder!)
+        encoder = nil
+        MLX.GPU.clearCache()
+        return result
+    }
+
+    // MARK: - Generation
+
+    /// The universal VACE entry: structural conditioning rides the VCU built from the
+    /// condition `frames` + `mask`; the mode (inpaint / i2v / flf2v / control) is purely
+    /// how the caller constructs that pair. Relay: umT5 encode→evict → VCU build (VAE
+    /// encode) → VACE denoise → VAE decode. Returns frames `[1, 3, T', H', W']` in [-1, 1].
+    /// - frames: condition video `[3, T, H, W]` in [-1, 1] (channels-first).
+    /// - mask: per-pixel 0/1 `[1, T, H, W]` (1 = regenerate/reactive, 0 = keep/inactive).
+    public func generate(
+        prompt: String,
+        negativePrompt: String? = nil,
+        frames: MLXArray,
+        mask: MLXArray,
+        steps: Int? = nil,
+        guideScale: Double? = nil,
+        vaceContextScale: Float = 1.0,
+        seed: UInt64? = nil,
+        onStep: ((Int, Int, MLXArray) throws -> Void)? = nil
+    ) throws -> MLXArray {
+        let negative = negativePrompt ?? config.sampleNegPrompt
+
+        // §2.4: page umT5 in, encode cond/uncond, evict before denoise.
+        let (contextCond, contextNull) = try withTextEncoder { enc -> (MLXArray, MLXArray) in
+            let c = encodeText(
+                encoder: enc, tokenizer: tokenizer, prompt: prompt, textLen: config.textLen)
+            let n = encodeText(
+                encoder: enc, tokenizer: tokenizer, prompt: negative, textLen: config.textLen)
+            eval(c, n)
+            return (c, n)
+        }
+
+        // Build the VCU on the CPU stream (fp32 VAE encode + watchdog discipline).
+        let vcu = Device.withDefaultDevice(.cpu) { () -> MLXArray in
+            let v = VaceVCU.buildVCU(vae: vae, frames: frames, mask: mask)
+            eval(v)
+            return v
+        }
+        // Noise matches the VCU's latent geometry: [zDim, Tl, Hl, Wl].
+        let (tLat, hLat, wLat) = (vcu.dim(1), vcu.dim(2), vcu.dim(3))
+        if let seed { MLXRandom.seed(seed) }
+        let noise = MLXRandom.normal([config.vaeZDim, tLat, hLat, wLat])
+
+        let latent = try denoiseVACE(
+            model: model, config: config, contextCond: contextCond, contextNull: contextNull,
+            vaceContext: vcu, noise: noise, steps: steps ?? config.sampleSteps,
+            shift: config.sampleShift, guideScale: guideScale ?? (config.sampleGuideScale.first ?? 5.0),
+            vaceContextScale: vaceContextScale, onStep: onStep)
+        eval(latent)
+        MLX.GPU.clearCache()  // drop the denoise working set before the decode
+
+        return decodeLatent(latent)
+    }
+
+    /// Decode a channels-first DiT latent `[C, Tl, Hl, Wl]` → frames `[1, 3, T', H', W']`
+    /// in [-1, 1]. The 16-ch WanVAE decode runs on the CPU stream (fp32 parity / watchdog).
+    public func decodeLatent(_ latent: MLXArray) -> MLXArray {
+        Device.withDefaultDevice(.cpu) {
+            let video = vae.decode(latent.expandedDimensions(axis: 0))  // [1, 3, T', H', W']
+            eval(video)
+            return video
+        }
+    }
+
+    // MARK: - Modes (no preprocessing — the consumer-first set)
+
+    /// First-frame image-to-video. The image occupies (and stays frozen at) frame 0
+    /// (inactive); the rest is generated (reactive). No preprocessing.
+    /// - image: `[3, H, W]` in [-1, 1] (channels-first).
+    public func i2v(
+        image: MLXArray, prompt: String, negativePrompt: String? = nil,
+        numFrames: Int = 81, steps: Int? = nil, guideScale: Double? = nil,
+        seed: UInt64? = nil, onStep: ((Int, Int, MLXArray) throws -> Void)? = nil
+    ) throws -> MLXArray {
+        let (h, w) = (image.dim(1), image.dim(2))
+        // frame 0 = the image, rest = 0 (gray); mask 0 = keep frame 0, 1 = generate the rest.
+        let rest = MLXArray.zeros([3, numFrames - 1, h, w])
+        let frames = concatenated([image.expandedDimensions(axis: 1), rest], axis: 1)  // [3, T, H, W]
+        let m0 = MLXArray.zeros([1, 1, h, w])
+        let mRest = MLXArray.ones([1, numFrames - 1, h, w])
+        let mask = concatenated([m0, mRest], axis: 1)  // [1, T, H, W]
+        return try generate(
+            prompt: prompt, negativePrompt: negativePrompt, frames: frames, mask: mask,
+            steps: steps, guideScale: guideScale, seed: seed, onStep: onStep)
+    }
+
+    /// Inpainting / video-editing: regenerate the masked region of a source video,
+    /// keep the rest. No preprocessing.
+    /// - video: `[3, T, H, W]` in [-1, 1]; mask: `[1, T, H, W]` 0/1 (1 = regenerate).
+    public func inpaint(
+        video: MLXArray, mask: MLXArray, prompt: String, negativePrompt: String? = nil,
+        steps: Int? = nil, guideScale: Double? = nil, seed: UInt64? = nil,
+        onStep: ((Int, Int, MLXArray) throws -> Void)? = nil
+    ) throws -> MLXArray {
+        try generate(
+            prompt: prompt, negativePrompt: negativePrompt, frames: video, mask: mask,
+            steps: steps, guideScale: guideScale, seed: seed, onStep: onStep)
+    }
+}

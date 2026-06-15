@@ -31,9 +31,32 @@ public enum VaceVCU {
         return m
     }
 
+    /// Encode condition frames to the 32-ch `z0` latent — verbatim `vace_encode_frames` (the
+    /// masked branch). Splits the frames into the inactive (`frames·(1−mask)`) and reactive
+    /// (`frames·mask`) videos, VAE-encodes each (the 16-ch WanVAE, parity-locked), and concats
+    /// → `[32, Tl, Hl, Wl]`. `frames`: `[3, T, H, W]` in [-1, 1] (channels-first); `mask`:
+    /// `[1, T, H, W]` in {0,1}. The mask is thresholded at 0.5 like the oracle.
+    public static func encodeFrames(vae: WanVAE, frames: MLXArray, mask: MLXArray) -> MLXArray {
+        let m = MLX.where(mask .> 0.5, MLXArray(Float(1)), MLXArray(Float(0)))  // [1, T, H, W]
+        let inactive = frames * (1 - m)                  // [3, T, H, W] (broadcast over channels)
+        let reactive = frames * m
+        let zIn = vae.encode(inactive.expandedDimensions(axis: 0))[0]  // [16, Tl, Hl, Wl]
+        let zRe = vae.encode(reactive.expandedDimensions(axis: 0))[0]  // [16, Tl, Hl, Wl]
+        return concatenated([zIn, zRe], axis: 0)         // [32, Tl, Hl, Wl]
+    }
+
     /// VCU = `cat(z0[32], mask64[64]) = [96, newDepth, hLat, wLat]`. `z0` is the VAE-encoded
     /// inactive⊕reactive latent (channels-first), `mask` the pixel 0/1 mask.
     public static func build(z0: MLXArray, mask: MLXArray, vaeStride: [Int] = [4, 8, 8]) -> MLXArray {
         concatenated([z0, maskSpaceToDepth(mask, vaeStride: vaeStride)], axis: 0)
+    }
+
+    /// Full VCU from condition frames + pixel mask: `encodeFrames → build`. Both halves are
+    /// parity-locked (WanVAE.encode 3e-6, mask space-to-depth <1e-6), so the composite is
+    /// correct by construction. Returns `[96, Tl, Hl, Wl]`.
+    public static func buildVCU(
+        vae: WanVAE, frames: MLXArray, mask: MLXArray, vaeStride: [Int] = [4, 8, 8]
+    ) -> MLXArray {
+        build(z0: encodeFrames(vae: vae, frames: frames, mask: mask), mask: mask, vaeStride: vaeStride)
     }
 }
