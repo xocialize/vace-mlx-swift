@@ -66,6 +66,7 @@ public func denoiseVACE(
         latents = stepped.squeezed(axis: 0)
         eval(latents)
         MLX.GPU.clearCache()  // per-step buffer-cache discipline
+        vaceMemLog("denoise step \(i + 1)/\(steps)")  // E15: maps the memory climb to steps
         try onStep?(i, steps, latents)
     }
     return latents

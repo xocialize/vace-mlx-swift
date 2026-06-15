@@ -18,6 +18,19 @@ import MLXRandom
 import Tokenizers
 import WanCore
 
+/// Per-phase memory breakdown (E15 Addendum-4 root-cause): logs MLX's `active` vs `cache` vs
+/// `peak` + the live `cacheLimit` at each pipeline phase, to resolve WHAT the ~106 GB floor is
+/// and WHEN it appears — the floor is dtype- AND seqLen-invariant, so it's not weights/activations/
+/// attention. `active ≈ 100` ⇒ a live/fixed allocation (chase what). `cache ≈ 100` with
+/// `cacheLimit` small ⇒ the cap isn't trimming this phase (chase why). Opt-in via `VACE_MEM_LOG=1`.
+func vaceMemLog(_ phase: String) {
+    guard ProcessInfo.processInfo.environment["VACE_MEM_LOG"] != nil else { return }
+    let s = Memory.snapshot()
+    func gb(_ b: Int) -> String { String(format: "%.1f", Double(b) / 1e9) }
+    print("[VACE mem] \(phase): active=\(gb(s.activeMemory)) cache=\(gb(s.cacheMemory)) "
+        + "peak=\(gb(s.peakMemory)) cacheLimit=\(gb(Memory.cacheLimit)) (GB)")
+}
+
 public final class VACEPipeline: @unchecked Sendable {
     public let config: WanConfig
     /// The VACE Context-Adapter DiT (`VaceWanModel`): the wan-core backbone + the
@@ -71,6 +84,7 @@ public final class VACEPipeline: @unchecked Sendable {
 
         let model = try loadDiT(
             modelDir: modelDir, config: config, vaceLayers: vaceLayers, ditDType: ditDType)
+        vaceMemLog("DiT loaded")
 
         // 16-ch WanVAE (encoder + decoder), fp32 on the CPU stream (parity + watchdog).
         let vae = WanVAE(zDim: config.vaeZDim, encoder: true)
@@ -152,9 +166,11 @@ public final class VACEPipeline: @unchecked Sendable {
         onStep: ((Int, Int, MLXArray) throws -> Void)? = nil
     ) throws -> MLXArray {
         let negative = negativePrompt ?? config.sampleNegPrompt
+        vaceMemLog("generate.start (model+vae resident)")
 
         // §2.4: page umT5 in, encode cond/uncond, evict before denoise.
         let (contextCond, contextNull) = try withTextEncoder { enc -> (MLXArray, MLXArray) in
+            vaceMemLog("umT5 loaded (pre-encode)")
             let c = encodeText(
                 encoder: enc, tokenizer: tokenizer, prompt: prompt, textLen: config.textLen)
             let n = encodeText(
@@ -162,6 +178,7 @@ public final class VACEPipeline: @unchecked Sendable {
             eval(c, n)
             return (c, n)
         }
+        vaceMemLog("umT5 evicted (post-encode)")
 
         // Build the VCU on the CPU stream (fp32 VAE encode + watchdog discipline).
         let vcu = Device.withDefaultDevice(.cpu) { () -> MLXArray in
@@ -169,6 +186,7 @@ public final class VACEPipeline: @unchecked Sendable {
             eval(v)
             return v
         }
+        vaceMemLog("VCU built (pre-denoise)")
         // Noise matches the VCU's latent geometry: [zDim, Tl, Hl, Wl].
         let (tLat, hLat, wLat) = (vcu.dim(1), vcu.dim(2), vcu.dim(3))
         if let seed { MLXRandom.seed(seed) }
@@ -180,9 +198,13 @@ public final class VACEPipeline: @unchecked Sendable {
             shift: config.sampleShift, guideScale: guideScale ?? (config.sampleGuideScale.first ?? 5.0),
             vaceContextScale: vaceContextScale, onStep: onStep)
         eval(latent)
+        vaceMemLog("denoise done (pre-clearCache)")
         MLX.GPU.clearCache()  // drop the denoise working set before the decode
+        vaceMemLog("post-denoise clearCache (pre-decode)")
 
-        return decodeLatent(latent)
+        let frames = decodeLatent(latent)
+        vaceMemLog("decode done")
+        return frames
     }
 
     /// Decode a channels-first DiT latent `[C, Tl, Hl, Wl]` → frames `[1, 3, T', H', W']`
