@@ -59,6 +59,16 @@ public final class VACEPipeline: @unchecked Sendable {
         // matching the oracle + the parity tests.)
         let vaceLayers = Array(stride(from: 0, to: config.numLayers, by: 2))
 
+        // Self-certifying config line (E15): prove from the console WHICH path this process
+        // actually took — "set in the scheme" ≠ "engaged in this run". Covers the experiment
+        // knobs (DiT dtype + the fp32-SDPA upcast) and the memory caps. The runtime analog of
+        // the artifact/label check, for config the binary can't reveal statically.
+        let env = ProcessInfo.processInfo.environment
+        print("[VACE config] ditDType=\(ditDType) "
+            + "WAN_FP32_SDPA=\(wanForceFp32SdpaLargeSeq ? 1 : 0) (wanLargeSeq=\(wanLargeSeq)) "
+            + "DENOISE_CACHE_MB=\(env["DENOISE_CACHE_MB"] ?? "2048") "
+            + "DECODE_CACHE_MB=\(env["DECODE_CACHE_MB"] ?? "2048")")
+
         let model = try loadDiT(
             modelDir: modelDir, config: config, vaceLayers: vaceLayers, ditDType: ditDType)
 
