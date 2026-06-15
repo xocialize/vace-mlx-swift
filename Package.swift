@@ -16,9 +16,14 @@ let package = Package(
     ],
     products: [
         .library(name: "VACE", targets: ["VACE"]),
+        // The MLXEngine wrapper: a conformant `ModelPackage` over the core pipeline.
+        .library(name: "MLXVACE", targets: ["MLXVACE"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
+        // MLXEngine contract (MLXToolKit) for the wrapper target — the core `VACE` target
+        // stays engine-agnostic.
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.4.0"),
         // The neutral Wan substrate (WanModel + 16-ch VAE + umT5 + RoPE + schedulers + loader).
         .package(path: "../wan-core-mlx-swift"),
     ],
@@ -33,6 +38,15 @@ let package = Package(
                 .product(name: "MLXRandom", package: "mlx-swift"),
             ],
             path: "Sources/VACE"
+        ),
+        .target(
+            name: "MLXVACE",
+            dependencies: [
+                "VACE",
+                .product(name: "WanCore", package: "wan-core-mlx-swift"),
+                .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+            ],
+            path: "Sources/MLXVACE"
         ),
         .testTarget(
             name: "VACETests",

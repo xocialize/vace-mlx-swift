@@ -187,6 +187,22 @@ public final class VACEPipeline: @unchecked Sendable {
 
     // MARK: - Modes (no preprocessing — the consumer-first set)
 
+    /// Pure text-to-video. VACE has no unconditional path — t2v is the degenerate VCU:
+    /// zero (gray) condition frames + an all-reactive mask, so the structural branch
+    /// carries no content and generation is purely prompt-driven. No preprocessing.
+    public func t2v(
+        prompt: String, negativePrompt: String? = nil,
+        width: Int = 832, height: Int = 480, numFrames: Int = 81,
+        steps: Int? = nil, guideScale: Double? = nil, seed: UInt64? = nil,
+        onStep: ((Int, Int, MLXArray) throws -> Void)? = nil
+    ) throws -> MLXArray {
+        let frames = MLXArray.zeros([3, numFrames, height, width])
+        let mask = MLXArray.ones([1, numFrames, height, width])
+        return try generate(
+            prompt: prompt, negativePrompt: negativePrompt, frames: frames, mask: mask,
+            steps: steps, guideScale: guideScale, seed: seed, onStep: onStep)
+    }
+
     /// First-frame image-to-video. The image occupies (and stays frozen at) frame 0
     /// (inactive); the rest is generated (reactive). No preprocessing.
     /// - image: `[3, H, W]` in [-1, 1] (channels-first).
