@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import WanCore
 
@@ -35,6 +36,16 @@ public func denoiseVACE(
     let timesteps = sched.timesteps
 
     var latents = noise
+    // Cap the buffer cache during the denoise — VACE's HEAVY phase (seqLen ≫ wanLargeSeq ⇒ fp32
+    // SDPA in every block). The per-block eval bounds the live graph and the per-step `clearCache`
+    // reclaims at step boundaries, but only `Memory.cacheLimit` bounds the IN-step high-water:
+    // freed block transients otherwise accumulate to ~the peak (the E15 ~105 GB plateau). This is
+    // the TI2V decode lever (ti2v `c98cdc6`) applied to VACE's actual heavy phase. Env
+    // `DENOISE_CACHE_MB` overrides (0 = max reclaim); restored after the loop.
+    let prevCacheLimit = Memory.cacheLimit
+    let capMB = ProcessInfo.processInfo.environment["DENOISE_CACHE_MB"].flatMap { Int($0) } ?? 2048
+    Memory.cacheLimit = capMB * 1_000_000
+    defer { Memory.cacheLimit = prevCacheLimit }
     for i in 0..<steps {
         let t = Float(timesteps[i])
         let noisePred: MLXArray
