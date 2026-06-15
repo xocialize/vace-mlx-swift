@@ -180,8 +180,18 @@ public final class VACEPipeline: @unchecked Sendable {
         }
         vaceMemLog("umT5 evicted (post-encode)")
 
-        // Build the VCU on the CPU stream (fp32 VAE encode + watchdog discipline).
+        // Build the VCU on the CPU stream (fp32 VAE encode). E15 Addendum-6: THIS is the ~106 GB /
+        // ~23-min phase — two full-res fp32 VAE encodes of the condition frames. Cap the buffer
+        // cache here too (the TI2V decode lever, ti2v `c98cdc6`): this phase runs BEFORE
+        // `denoiseVACE`, so the denoise cap never reached it, and the freed full-res conv
+        // intermediates otherwise accumulate to the box ceiling. Env `VCU_CACHE_MB` (default 2048).
+        vaceMemLog("VCU build: entry")
         let vcu = Device.withDefaultDevice(.cpu) { () -> MLXArray in
+            let prevCacheLimit = Memory.cacheLimit
+            let capMB = ProcessInfo.processInfo.environment["VCU_CACHE_MB"].flatMap { Int($0) } ?? 2048
+            Memory.cacheLimit = capMB * 1_000_000
+            defer { Memory.cacheLimit = prevCacheLimit }
+            MLX.GPU.clearCache()
             let v = VaceVCU.buildVCU(vae: vae, frames: frames, mask: mask)
             eval(v)
             return v
