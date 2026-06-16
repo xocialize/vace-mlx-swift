@@ -13,7 +13,7 @@ public func denoiseVACE(
     config: WanConfig,
     contextCond: MLXArray,      // raw umT5 features [L, text_dim] (positive)
     contextNull: MLXArray,      // raw umT5 features [L, text_dim] (negative/uncond)
-    vaceContext: MLXArray,      // the VCU [96, tLat, hLat, wLat]
+    vaceContext: MLXArray?,     // the VCU [96, tLat, hLat, wLat]; nil = no control (base t2v)
     noise: MLXArray,            // [C, tLat, hLat, wLat]
     steps: Int,
     shift: Double,
@@ -52,12 +52,12 @@ public func denoiseVACE(
         if cfg {
             let preds = model(
                 [latents, latents], t: MLXArray([t, t]), context: .embedded(contextCfg),
-                seqLen: seqLen, vaceContext: [vaceContext, vaceContext], vaceContextScale: vaceContextScale)
+                seqLen: seqLen, vaceContext: vaceContext.map { [$0, $0] }, vaceContextScale: vaceContextScale)
             noisePred = preds[1] + Float(guideScale) * (preds[0] - preds[1])
         } else {
             let preds = model(
                 [latents], t: MLXArray([t]), context: .embedded(contextCfg),
-                seqLen: seqLen, vaceContext: [vaceContext], vaceContextScale: vaceContextScale)
+                seqLen: seqLen, vaceContext: vaceContext.map { [$0] }, vaceContextScale: vaceContextScale)
             noisePred = preds[0]
         }
         let stepped = sched.step(

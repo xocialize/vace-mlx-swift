@@ -47,4 +47,34 @@ final class VaceDenoiseTests: XCTestCase {
             XCTAssertTrue(m.isFinite && mn.isFinite, "denoise produced non-finite latent")
         }
     }
+
+    /// The pure-t2v no-control path: `denoiseVACE(vaceContext: nil)` → base WanModel forward
+    /// (no VCU, no vace branch). Confirms the optional-control branch wires + yields finite output
+    /// (the base forward is already parity-locked in wan-core via Bernini/TI2V).
+    func testDenoiseNoControlRunsFinite() throws {
+        if !FileManager.default.fileExists(atPath: mlxWeights.path) {
+            throw XCTSkip("VACE weights not present")
+        }
+        try Device.withDefaultDevice(Device(.cpu)) {
+            let config = try WanConfig.load(
+                from: mlxWeights.deletingLastPathComponent().appendingPathComponent("config.json"))
+            let vaceLayers = Array(stride(from: 0, to: config.numLayers, by: 2))
+            let model = VaceWanModel(config: config, vaceLayers: vaceLayers, vaceInDim: 96)
+            let weights = try WeightLoader.loadSafetensors(url: mlxWeights).mapValues { $0.asType(.float32) }
+            try model.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+            eval(model.parameters())
+
+            let noise = try golden("in_x")               // [16, 1, 16, 16]
+            let ctxCond = try golden("in_context")       // [8, 4096]
+
+            let out = denoiseVACE(
+                model: model, config: config, contextCond: ctxCond, contextNull: ctxCond * 0,
+                vaceContext: nil, noise: noise, steps: 3, shift: 5.0, guideScale: 5.0)
+            eval(out)
+            let m = out.max().item(Float.self), mn = out.min().item(Float.self)
+            print("[VACE t2v no-control smoke] out \(out.shape) range [\(mn), \(m)]")
+            XCTAssertEqual(out.shape, [16, 1, 16, 16], "no-control output shape")
+            XCTAssertTrue(m.isFinite && mn.isFinite, "no-control produced non-finite latent")
+        }
+    }
 }

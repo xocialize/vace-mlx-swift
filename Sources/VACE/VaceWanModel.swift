@@ -67,13 +67,21 @@ public final class VaceWanModel: WanModel {
     }
 
     /// Full VACE forward: `embed` → vace-branch hints → `runBlocks` (inject) → `finish`.
+    /// `vaceContext: nil` skips the control branch entirely → the **base wan-core `WanModel`
+    /// forward** (no VCU, no vace blocks). For pure t2v this is exactly right: VACE's backbone
+    /// IS Wan2.1-T2V-1.3B unchanged, so no-control = base Wan t2v (coherent), and it sidesteps
+    /// the entire VCU-build VAE encode (E15). Non-nil = the current control path, unchanged.
     public func callAsFunction(
         _ x: [MLXArray], t: MLXArray, context: WanTextContext, seqLen: Int,
-        vaceContext: [MLXArray], vaceContextScale: Float = 1.0
+        vaceContext: [MLXArray]? = nil, vaceContextScale: Float = 1.0
     ) -> [MLXArray] {
         var state = embed(x, t: t, context: context, seqLen: seqLen)
-        let residuals = vaceHints(state, vaceContext: vaceContext, scale: vaceContextScale)
-        runBlocks(&state, blockResiduals: residuals)
+        if let vaceContext {
+            let residuals = vaceHints(state, vaceContext: vaceContext, scale: vaceContextScale)
+            runBlocks(&state, blockResiduals: residuals)
+        } else {
+            runBlocks(&state)  // base WanModel — no control branch (pure t2v)
+        }
         return finish(state)
     }
 }

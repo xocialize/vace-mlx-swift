@@ -239,20 +239,50 @@ public final class VACEPipeline: @unchecked Sendable {
 
     // MARK: - Modes (no preprocessing — the consumer-first set)
 
-    /// Pure text-to-video. VACE has no unconditional path — t2v is the degenerate VCU:
-    /// zero (gray) condition frames + an all-reactive mask, so the structural branch
-    /// carries no content and generation is purely prompt-driven. No preprocessing.
+    /// Pure text-to-video — **no control branch**. VACE's backbone IS Wan2.1-T2V-1.3B unchanged,
+    /// so t2v with no condition is base Wan t2v (coherent), and skipping the VCU sidesteps the
+    /// entire control-frame VAE encode (E15: the ~106 GB / glacial VCU-build wall — there is no
+    /// control signal to encode for pure t2v). `denoiseVACE(vaceContext: nil)` runs the base
+    /// `WanModel` forward. No preprocessing.
     public func t2v(
         prompt: String, negativePrompt: String? = nil,
         width: Int = 832, height: Int = 480, numFrames: Int = 81,
         steps: Int? = nil, guideScale: Double? = nil, seed: UInt64? = nil,
         onStep: ((Int, Int, MLXArray) throws -> Void)? = nil
     ) throws -> MLXArray {
-        let frames = MLXArray.zeros([3, numFrames, height, width])
-        let mask = MLXArray.ones([1, numFrames, height, width])
-        return try generate(
-            prompt: prompt, negativePrompt: negativePrompt, frames: frames, mask: mask,
-            steps: steps, guideScale: guideScale, seed: seed, onStep: onStep)
+        let negative = negativePrompt ?? config.sampleNegPrompt
+        vaceMemLog("t2v start (no control)")
+
+        // §2.4: page umT5 in, encode cond/uncond, evict before denoise.
+        let (contextCond, contextNull) = try withTextEncoder { enc -> (MLXArray, MLXArray) in
+            let c = encodeText(
+                encoder: enc, tokenizer: tokenizer, prompt: prompt, textLen: config.textLen)
+            let n = encodeText(
+                encoder: enc, tokenizer: tokenizer, prompt: negative, textLen: config.textLen)
+            eval(c, n)
+            return (c, n)
+        }
+        vaceMemLog("umT5 evicted (post-encode)")
+
+        // Latent geometry straight from the vae strides — no VCU to size it from.
+        let tLat = (numFrames - 1) / config.vaeStride[0] + 1
+        let hLat = height / config.vaeStride[1]
+        let wLat = width / config.vaeStride[2]
+        if let seed { MLXRandom.seed(seed) }
+        let noise = MLXRandom.normal([config.vaeZDim, tLat, hLat, wLat])
+
+        let latent = try denoiseVACE(
+            model: model, config: config, contextCond: contextCond, contextNull: contextNull,
+            vaceContext: nil, noise: noise, steps: steps ?? config.sampleSteps,
+            shift: config.sampleShift, guideScale: guideScale ?? (config.sampleGuideScale.first ?? 5.0),
+            onStep: onStep)
+        eval(latent)
+        vaceMemLog("denoise done (pre-decode)")
+        MLX.GPU.clearCache()
+
+        let frames = decodeLatent(latent)
+        vaceMemLog("decode done")
+        return frames
     }
 
     /// First-frame image-to-video. The image occupies (and stays frozen at) frame 0
