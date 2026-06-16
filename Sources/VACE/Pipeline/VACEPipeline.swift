@@ -220,10 +220,13 @@ public final class VACEPipeline: @unchecked Sendable {
     /// Decode a channels-first DiT latent `[C, Tl, Hl, Wl]` → frames `[1, 3, T', H', W']`
     /// in [-1, 1]. The 16-ch WanVAE decode runs on the CPU stream (fp32 parity / watchdog).
     ///
-    /// Caps the Metal buffer cache during decode (the TI2V-5B lever, ti2v `c98cdc6`): without
-    /// it the freed full-res conv intermediates accumulate into the phys high-water; a bounded
-    /// cache reclaims them on the next allocation so phys collapses toward the active set. Env
-    /// `DECODE_CACHE_MB` overrides (0 = max reclaim). Scoped to the decode, restored after.
+    /// **Streaming** (`decodeStreaming`, one latent chunk at a time): E15 Addendum-12 measured the
+    /// whole-seq decode holding all frames live as the t2v residual — ~40 min + the entire 41→92 GB
+    /// climb. Streaming bounds the live set to one chunk (runtime + memory stop scaling with frames),
+    /// bit-identical. Plus the `Memory.cacheLimit` cap (ti2v `c98cdc6`) so freed full-res conv
+    /// intermediates reclaim continuously instead of accumulating to the phys high-water. Env
+    /// `DECODE_CACHE_MB` overrides (0 = max reclaim). (A chunked decode is also the safe GPU
+    /// candidate later — short per-chunk command buffers dodge the whole-seq watchdog-resubmit risk.)
     public func decodeLatent(_ latent: MLXArray) -> MLXArray {
         let prevCacheLimit = Memory.cacheLimit
         let capMB = ProcessInfo.processInfo.environment["DECODE_CACHE_MB"].flatMap { Int($0) } ?? 2048
@@ -231,7 +234,7 @@ public final class VACEPipeline: @unchecked Sendable {
         defer { Memory.cacheLimit = prevCacheLimit }
         MLX.GPU.clearCache()  // drop the denoise cache before the capped decode begins
         return Device.withDefaultDevice(.cpu) {
-            let video = vae.decode(latent.expandedDimensions(axis: 0))  // [1, 3, T', H', W']
+            let video = decodeStreaming(vae: vae, latent.expandedDimensions(axis: 0), chunkLat: 1)
             eval(video)
             return video
         }
