@@ -142,7 +142,7 @@ public final class VACEPipeline: @unchecked Sendable {
         var encoder: UMT5EncoderModel? = try loadTextEncoder()
         let result = try body(encoder!)
         encoder = nil
-        MLX.GPU.clearCache()
+        MLX.Memory.clearCache()
         return result
     }
 
@@ -169,14 +169,16 @@ public final class VACEPipeline: @unchecked Sendable {
         vaceMemLog("generate.start (model+vae resident)")
 
         // §2.4: page umT5 in, encode cond/uncond, evict before denoise.
-        let (contextCond, contextNull) = try withTextEncoder { enc -> (MLXArray, MLXArray) in
-            vaceMemLog("umT5 loaded (pre-encode)")
-            let c = encodeText(
-                encoder: enc, tokenizer: tokenizer, prompt: prompt, textLen: config.textLen)
-            let n = encodeText(
-                encoder: enc, tokenizer: tokenizer, prompt: negative, textLen: config.textLen)
-            eval(c, n)
-            return (c, n)
+        let (contextCond, contextNull) = try WanProfiler.shared.region("phase", "text_encode") {
+            try withTextEncoder { enc -> (MLXArray, MLXArray) in
+                vaceMemLog("umT5 loaded (pre-encode)")
+                let c = encodeText(
+                    encoder: enc, tokenizer: tokenizer, prompt: prompt, textLen: config.textLen)
+                let n = encodeText(
+                    encoder: enc, tokenizer: tokenizer, prompt: negative, textLen: config.textLen)
+                eval(c, n)
+                return (c, n)
+            }
         }
         vaceMemLog("umT5 evicted (post-encode)")
 
@@ -186,15 +188,17 @@ public final class VACEPipeline: @unchecked Sendable {
         // `denoiseVACE`, so the denoise cap never reached it, and the freed full-res conv
         // intermediates otherwise accumulate to the box ceiling. Env `VCU_CACHE_MB` (default 2048).
         vaceMemLog("VCU build: entry")
-        let vcu = Device.withDefaultDevice(.cpu) { () -> MLXArray in
-            let prevCacheLimit = Memory.cacheLimit
-            let capMB = ProcessInfo.processInfo.environment["VCU_CACHE_MB"].flatMap { Int($0) } ?? 2048
-            Memory.cacheLimit = capMB * 1_000_000
-            defer { Memory.cacheLimit = prevCacheLimit }
-            MLX.GPU.clearCache()
-            let v = VaceVCU.buildVCU(vae: vae, frames: frames, mask: mask)
-            eval(v)
-            return v
+        let vcu = WanProfiler.shared.region("phase", "vcu_build") {
+            Device.withDefaultDevice(.cpu) { () -> MLXArray in
+                let prevCacheLimit = Memory.cacheLimit
+                let capMB = ProcessInfo.processInfo.environment["VCU_CACHE_MB"].flatMap { Int($0) } ?? 2048
+                Memory.cacheLimit = capMB * 1_000_000
+                defer { Memory.cacheLimit = prevCacheLimit }
+                MLX.Memory.clearCache()
+                let v = VaceVCU.buildVCU(vae: vae, frames: frames, mask: mask)
+                eval(v)
+                return v
+            }
         }
         vaceMemLog("VCU built (pre-denoise)")
         // Noise matches the VCU's latent geometry: [zDim, Tl, Hl, Wl].
@@ -202,17 +206,20 @@ public final class VACEPipeline: @unchecked Sendable {
         if let seed { MLXRandom.seed(seed) }
         let noise = MLXRandom.normal([config.vaeZDim, tLat, hLat, wLat])
 
-        let latent = try denoiseVACE(
-            model: model, config: config, contextCond: contextCond, contextNull: contextNull,
-            vaceContext: vcu, noise: noise, steps: steps ?? config.sampleSteps,
-            shift: config.sampleShift, guideScale: guideScale ?? (config.sampleGuideScale.first ?? 5.0),
-            vaceContextScale: vaceContextScale, onStep: onStep)
-        eval(latent)
+        let latent = try WanProfiler.shared.region("phase", "denoise") {
+            let l = try denoiseVACE(
+                model: model, config: config, contextCond: contextCond, contextNull: contextNull,
+                vaceContext: vcu, noise: noise, steps: steps ?? config.sampleSteps,
+                shift: config.sampleShift, guideScale: guideScale ?? (config.sampleGuideScale.first ?? 5.0),
+                vaceContextScale: vaceContextScale, onStep: onStep)
+            eval(l)
+            return l
+        }
         vaceMemLog("denoise done (pre-clearCache)")
-        MLX.GPU.clearCache()  // drop the denoise working set before the decode
+        MLX.Memory.clearCache()  // drop the denoise working set before the decode
         vaceMemLog("post-denoise clearCache (pre-decode)")
 
-        let frames = decodeLatent(latent)
+        let frames = WanProfiler.shared.region("phase", "decode") { decodeLatent(latent) }
         vaceMemLog("decode done")
         return frames
     }
@@ -232,8 +239,12 @@ public final class VACEPipeline: @unchecked Sendable {
         let capMB = ProcessInfo.processInfo.environment["DECODE_CACHE_MB"].flatMap { Int($0) } ?? 2048
         Memory.cacheLimit = capMB * 1_000_000
         defer { Memory.cacheLimit = prevCacheLimit }
-        MLX.GPU.clearCache()  // drop the denoise cache before the capped decode begins
-        return Device.withDefaultDevice(.cpu) {
+        MLX.Memory.clearCache()  // drop the denoise cache before the capped decode begins
+        // DECODE_DEVICE=gpu runs the streaming VAE decode on the GPU stream. Default stays .cpu
+        // (fp32 parity / cold-load-watchdog avoidance). Per-chunk command buffers are short, so the
+        // whole-seq watchdog-resubmit risk is bounded — this toggle is the A/B for the CPU-bound wall.
+        let decodeDevice: Device = (ProcessInfo.processInfo.environment["DECODE_DEVICE"] == "gpu") ? .gpu : .cpu
+        return Device.withDefaultDevice(decodeDevice) {
             let video = decodeStreaming(vae: vae, latent.expandedDimensions(axis: 0), chunkLat: 1)
             eval(video)
             return video
@@ -257,13 +268,15 @@ public final class VACEPipeline: @unchecked Sendable {
         vaceMemLog("t2v start (no control)")
 
         // §2.4: page umT5 in, encode cond/uncond, evict before denoise.
-        let (contextCond, contextNull) = try withTextEncoder { enc -> (MLXArray, MLXArray) in
-            let c = encodeText(
-                encoder: enc, tokenizer: tokenizer, prompt: prompt, textLen: config.textLen)
-            let n = encodeText(
-                encoder: enc, tokenizer: tokenizer, prompt: negative, textLen: config.textLen)
-            eval(c, n)
-            return (c, n)
+        let (contextCond, contextNull) = try WanProfiler.shared.region("phase", "text_encode") {
+            try withTextEncoder { enc -> (MLXArray, MLXArray) in
+                let c = encodeText(
+                    encoder: enc, tokenizer: tokenizer, prompt: prompt, textLen: config.textLen)
+                let n = encodeText(
+                    encoder: enc, tokenizer: tokenizer, prompt: negative, textLen: config.textLen)
+                eval(c, n)
+                return (c, n)
+            }
         }
         vaceMemLog("umT5 evicted (post-encode)")
 
@@ -274,16 +287,19 @@ public final class VACEPipeline: @unchecked Sendable {
         if let seed { MLXRandom.seed(seed) }
         let noise = MLXRandom.normal([config.vaeZDim, tLat, hLat, wLat])
 
-        let latent = try denoiseVACE(
-            model: model, config: config, contextCond: contextCond, contextNull: contextNull,
-            vaceContext: nil, noise: noise, steps: steps ?? config.sampleSteps,
-            shift: config.sampleShift, guideScale: guideScale ?? (config.sampleGuideScale.first ?? 5.0),
-            onStep: onStep)
-        eval(latent)
+        let latent = try WanProfiler.shared.region("phase", "denoise") {
+            let l = try denoiseVACE(
+                model: model, config: config, contextCond: contextCond, contextNull: contextNull,
+                vaceContext: nil, noise: noise, steps: steps ?? config.sampleSteps,
+                shift: config.sampleShift, guideScale: guideScale ?? (config.sampleGuideScale.first ?? 5.0),
+                onStep: onStep)
+            eval(l)
+            return l
+        }
         vaceMemLog("denoise done (pre-decode)")
-        MLX.GPU.clearCache()
+        MLX.Memory.clearCache()
 
-        let frames = decodeLatent(latent)
+        let frames = WanProfiler.shared.region("phase", "decode") { decodeLatent(latent) }
         vaceMemLog("decode done")
         return frames
     }

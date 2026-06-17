@@ -7,7 +7,7 @@ import WanCore
 /// (15 `VaceWanAttentionBlock`s). The branch runs on the embedded latent + the same per-block kwargs,
 /// and its hints inject through wan-core's `runBlocks(blockResiduals:)` seam.
 /// Oracle: `wan/modules/vace_model.py` `VaceWanModel`.
-public final class VaceWanModel: WanModel {
+public final class VaceWanModel: WanModel, @unchecked Sendable {
     @ModuleInfo(key: "vace_patch_embedding_proj") public var vacePatchEmbeddingProj: Linear
     @ModuleInfo(key: "vace_blocks") public var vaceBlocks: [VaceWanAttentionBlock]
 

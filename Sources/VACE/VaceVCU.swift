@@ -51,10 +51,10 @@ public enum VaceVCU {
         // the two so inactive fully releases before reactive.
         vaceMemLog("VCU: pre inactive-encode")
         let zIn = encodeStreaming(vae: vae, inactive.expandedDimensions(axis: 0))[0]  // [16, Tl, Hl, Wl]
-        eval(zIn); MLX.GPU.clearCache()
+        eval(zIn); MLX.Memory.clearCache()
         vaceMemLog("VCU: inactive encoded")
         let zRe = encodeStreaming(vae: vae, reactive.expandedDimensions(axis: 0))[0]  // [16, Tl, Hl, Wl]
-        eval(zRe); MLX.GPU.clearCache()
+        eval(zRe); MLX.Memory.clearCache()
         vaceMemLog("VCU: reactive encoded")
         return concatenated([zIn, zRe], axis: 0)         // [32, Tl, Hl, Wl]
     }

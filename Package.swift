@@ -18,6 +18,8 @@ let package = Package(
         .library(name: "VACE", targets: ["VACE"]),
         // The MLXEngine wrapper: a conformant `ModelPackage` over the core pipeline.
         .library(name: "MLXVACE", targets: ["MLXVACE"]),
+        // GPU profiling CLI (P1 of the perf program): one real t2v run under WanProfiler.
+        .executable(name: "RunVACE", targets: ["RunVACE"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
@@ -47,6 +49,15 @@ let package = Package(
                 .product(name: "MLXToolKit", package: "mlx-engine-swift"),
             ],
             path: "Sources/MLXVACE"
+        ),
+        .executableTarget(
+            name: "RunVACE",
+            dependencies: [
+                "VACE",
+                .product(name: "WanCore", package: "wan-core-mlx-swift"),
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Sources/RunVACE"
         ),
         .testTarget(
             name: "VACETests",

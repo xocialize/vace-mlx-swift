@@ -46,26 +46,32 @@ public func denoiseVACE(
     let capMB = ProcessInfo.processInfo.environment["DENOISE_CACHE_MB"].flatMap { Int($0) } ?? 2048
     Memory.cacheLimit = capMB * 1_000_000
     defer { Memory.cacheLimit = prevCacheLimit }
+    let stepNote = "seqLen=\(seqLen) cfg=\(cfg ? 2 : 1)"  // forwards/step: 2 (CFG batched) or 1
     for i in 0..<steps {
         let t = Float(timesteps[i])
-        let noisePred: MLXArray
-        if cfg {
-            let preds = model(
-                [latents, latents], t: MLXArray([t, t]), context: .embedded(contextCfg),
-                seqLen: seqLen, vaceContext: vaceContext.map { [$0, $0] }, vaceContextScale: vaceContextScale)
-            noisePred = preds[1] + Float(guideScale) * (preds[0] - preds[1])
-        } else {
-            let preds = model(
-                [latents], t: MLXArray([t]), context: .embedded(contextCfg),
-                seqLen: seqLen, vaceContext: vaceContext.map { [$0] }, vaceContextScale: vaceContextScale)
-            noisePred = preds[0]
+        // Coarse per-step timer (WAN_PROFILE=1): one DiT forward (CFG-batched B=2) + scheduler
+        // step. The body self-`eval`s, so the region wall-clock is honest. This is the headline
+        // cost of a Wan generation — N steps × this. (Deep DiT breakdown: WAN_PROFILE_DEEP=blocks.)
+        WanProfiler.shared.region("denoise", "step", index: i, note: stepNote) {
+            let noisePred: MLXArray
+            if cfg {
+                let preds = model(
+                    [latents, latents], t: MLXArray([t, t]), context: .embedded(contextCfg),
+                    seqLen: seqLen, vaceContext: vaceContext.map { [$0, $0] }, vaceContextScale: vaceContextScale)
+                noisePred = preds[1] + Float(guideScale) * (preds[0] - preds[1])
+            } else {
+                let preds = model(
+                    [latents], t: MLXArray([t]), context: .embedded(contextCfg),
+                    seqLen: seqLen, vaceContext: vaceContext.map { [$0] }, vaceContextScale: vaceContextScale)
+                noisePred = preds[0]
+            }
+            let stepped = sched.step(
+                modelOutput: noisePred.expandedDimensions(axis: 0), timestep: t,
+                sample: latents.expandedDimensions(axis: 0))
+            latents = stepped.squeezed(axis: 0)
+            eval(latents)
         }
-        let stepped = sched.step(
-            modelOutput: noisePred.expandedDimensions(axis: 0), timestep: t,
-            sample: latents.expandedDimensions(axis: 0))
-        latents = stepped.squeezed(axis: 0)
-        eval(latents)
-        MLX.GPU.clearCache()  // per-step buffer-cache discipline
+        MLX.Memory.clearCache()  // per-step buffer-cache discipline
         vaceMemLog("denoise step \(i + 1)/\(steps)")  // E15: maps the memory climb to steps
         try onStep?(i, steps, latents)
     }
