@@ -45,4 +45,48 @@ final class VacePipelineTests: XCTestCase {
             XCTAssertLessThanOrEqual(mx, 1.0001)
         }
     }
+
+    /// W5 DEFINITIVE end-to-end temporal-direction check. i2v freezes a known image at frame 0
+    /// (mask 0 = keep). With a strong top-bright/bottom-dark first frame, the frozen frame carries a
+    /// large top−bottom luminance contrast (~+1.8). Forward order ⇒ that contrast peaks at OUTPUT
+    /// frame 0; a clean temporal reversal ⇒ it peaks at the LAST output frame. Computable (no need to
+    /// watch). Tiny dims + CPU to stay tractable. Skips unless the full checkpoint is present.
+    func testI2VTemporalDirectionEndToEnd() async throws {
+        let needed = ["model.safetensors", "vae.safetensors", "t5_encoder.safetensors", "config.json"]
+        for f in needed where !FileManager.default.fileExists(
+            atPath: Self.mlxDir.appendingPathComponent(f).path) {
+            throw XCTSkip("VACE checkpoint incomplete (missing \(f))")
+        }
+
+        try await Device.withDefaultDevice(Device(.cpu)) {
+            let pipe = try await VACEPipeline.fromPretrained(modelDir: Self.mlxDir)
+
+            let (h, w) = (128, 128)
+            // Distinctive first frame: top half bright (+0.9), bottom half dark (-0.9).
+            let top = MLXArray.ones([3, h / 2, w]) * Float(0.9)
+            let bot = MLXArray.ones([3, h / 2, w]) * Float(-0.9)
+            let image = concatenated([top, bot], axis: 1)  // [3, H, W] in [-1, 1]
+
+            let out = try pipe.i2v(
+                image: image, prompt: "a calm ocean at sunset", numFrames: 9, steps: 4, seed: 0)
+            eval(out)
+            let tOut = out.dim(2)
+
+            func contrast(_ f: Int) -> Float {
+                let frame = out[0, 0..., f, 0..., 0...]            // [3, H, W]
+                let t = frame[0..., 0..<(h / 2), 0...].mean().item(Float.self)
+                let b = frame[0..., (h / 2)..., 0...].mean().item(Float.self)
+                return t - b
+            }
+            let perFrame = (0..<tOut).map { contrast($0) }
+            let argmax = perFrame.firstIndex(of: perFrame.max()!)!
+            print("[W5 i2v dir] per-frame top−bottom contrast (\(tOut)): "
+                + "\(perFrame.map { String(format: "%.3f", $0) })  argmax=\(argmax)")
+            // The frozen input frame (highest contrast) MUST be the FIRST output frame (forward order).
+            XCTAssertLessThan(
+                argmax, tOut / 2,
+                "i2v frozen first-frame surfaced at output frame \(argmax)/\(tOut) — if near the END, "
+                + "the pipeline REVERSES temporal order (W5). contrasts=\(perFrame)")
+        }
+    }
 }
