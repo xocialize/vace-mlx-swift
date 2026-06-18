@@ -16,6 +16,15 @@ final class VacePipelineTests: XCTestCase {
     static let mlxDir = URL(fileURLWithPath:
         "/Volumes/DEV_ARCHIVE/vace-1.3b-measure/models/vace-1.3b-mlx")
 
+    // Pin decode + encode to the CPU stream for these CLI tests. `decodeLatent`/VCU-encode now
+    // default to the GPU stream (validated win), but this swift-test process uses the CPU stream
+    // (CLI metallib boundary); the env escape hatch keeps the in-test pipeline on CPU regardless.
+    override func setUp() {
+        super.setUp()
+        setenv("DECODE_DEVICE", "cpu", 1)
+        setenv("ENCODE_DEVICE", "cpu", 1)
+    }
+
     func testGenerateRelayRunsFinite() async throws {
         let needed = ["model.safetensors", "vae.safetensors", "t5_encoder.safetensors", "config.json"]
         for f in needed where !FileManager.default.fileExists(

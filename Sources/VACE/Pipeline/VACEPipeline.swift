@@ -187,14 +187,14 @@ public final class VACEPipeline: @unchecked Sendable {
         // TI2V decode lever, ti2v `c98cdc6`): this phase runs BEFORE `denoiseVACE`, so the denoise cap
         // never reached it, and the freed full-res conv intermediates otherwise accumulate to the box
         // ceiling. Env `VCU_CACHE_MB` (default 2048).
-        // ENCODE_DEVICE=gpu runs the streaming VAE *encode* on the GPU stream — the encode-side twin of
-        // DECODE_DEVICE. Default stays .cpu (fp32 parity / cold-load-watchdog avoidance). `encodeStreaming`
-        // evals per temporal chunk, so per-chunk command buffers are short and the whole-seq watchdog
-        // risk is bounded (same proof as the decode GPU fix). Unblocks i2v/v2v from the single-core CPU
-        // encode wall (i2v 49f sat ~12 min in this phase at ~107% CPU / GPU idle — W7).
+        // The streaming VAE *encode* runs on the GPU stream by default — the encode-side twin of the
+        // decode GPU default. `encodeStreaming` evals per temporal chunk, so per-chunk command buffers
+        // are short and the whole-seq watchdog risk is bounded. VALIDATED (W7): GPU VCU-encode is
+        // parity-clean + fast (the ~12–23 min single-core CPU wall → ~3.8 min). ENCODE_DEVICE=cpu is the
+        // escape hatch (legacy fp32-parity / watchdog-avoidance path).
         vaceMemLog("VCU build: entry")
         WanDebug.stats("vcu frames (pre-encode)", frames)
-        let encodeDevice: Device = (ProcessInfo.processInfo.environment["ENCODE_DEVICE"] == "gpu") ? .gpu : .cpu
+        let encodeDevice: Device = (ProcessInfo.processInfo.environment["ENCODE_DEVICE"] == "cpu") ? .cpu : .gpu
         let vcu = WanProfiler.shared.region("phase", "vcu_build") {
             Device.withDefaultDevice(encodeDevice) { () -> MLXArray in
                 let prevCacheLimit = Memory.cacheLimit
@@ -250,10 +250,10 @@ public final class VACEPipeline: @unchecked Sendable {
         Memory.cacheLimit = capMB * 1_000_000
         defer { Memory.cacheLimit = prevCacheLimit }
         MLX.Memory.clearCache()  // drop the denoise cache before the capped decode begins
-        // DECODE_DEVICE=gpu runs the streaming VAE decode on the GPU stream. Default stays .cpu
-        // (fp32 parity / cold-load-watchdog avoidance). Per-chunk command buffers are short, so the
-        // whole-seq watchdog-resubmit risk is bounded — this toggle is the A/B for the CPU-bound wall.
-        let decodeDevice: Device = (ProcessInfo.processInfo.environment["DECODE_DEVICE"] == "gpu") ? .gpu : .cpu
+        // The streaming VAE decode runs on the GPU stream by default — VALIDATED (16-ch): decode
+        // >27 min CPU → 46.6 s GPU, bounded, no watchdog at chunkLat=1 (short per-chunk command
+        // buffers). DECODE_DEVICE=cpu is the escape hatch (legacy fp32-parity / watchdog-avoidance).
+        let decodeDevice: Device = (ProcessInfo.processInfo.environment["DECODE_DEVICE"] == "cpu") ? .cpu : .gpu
         return Device.withDefaultDevice(decodeDevice) {
             let video = decodeStreaming(vae: vae, latent.expandedDimensions(axis: 0), chunkLat: 1)
             eval(video)
