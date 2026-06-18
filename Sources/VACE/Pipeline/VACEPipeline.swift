@@ -182,14 +182,21 @@ public final class VACEPipeline: @unchecked Sendable {
         }
         vaceMemLog("umT5 evicted (post-encode)")
 
-        // Build the VCU on the CPU stream (fp32 VAE encode). E15 Addendum-6: THIS is the ~106 GB /
-        // ~23-min phase — two full-res fp32 VAE encodes of the condition frames. Cap the buffer
-        // cache here too (the TI2V decode lever, ti2v `c98cdc6`): this phase runs BEFORE
-        // `denoiseVACE`, so the denoise cap never reached it, and the freed full-res conv
-        // intermediates otherwise accumulate to the box ceiling. Env `VCU_CACHE_MB` (default 2048).
+        // Build the VCU (fp32 VAE encode). E15 Addendum-6: THIS is the ~106 GB / ~23-min phase —
+        // two full-res fp32 VAE encodes of the condition frames. Cap the buffer cache here too (the
+        // TI2V decode lever, ti2v `c98cdc6`): this phase runs BEFORE `denoiseVACE`, so the denoise cap
+        // never reached it, and the freed full-res conv intermediates otherwise accumulate to the box
+        // ceiling. Env `VCU_CACHE_MB` (default 2048).
+        // ENCODE_DEVICE=gpu runs the streaming VAE *encode* on the GPU stream — the encode-side twin of
+        // DECODE_DEVICE. Default stays .cpu (fp32 parity / cold-load-watchdog avoidance). `encodeStreaming`
+        // evals per temporal chunk, so per-chunk command buffers are short and the whole-seq watchdog
+        // risk is bounded (same proof as the decode GPU fix). Unblocks i2v/v2v from the single-core CPU
+        // encode wall (i2v 49f sat ~12 min in this phase at ~107% CPU / GPU idle — W7).
         vaceMemLog("VCU build: entry")
+        WanDebug.stats("vcu frames (pre-encode)", frames)
+        let encodeDevice: Device = (ProcessInfo.processInfo.environment["ENCODE_DEVICE"] == "gpu") ? .gpu : .cpu
         let vcu = WanProfiler.shared.region("phase", "vcu_build") {
-            Device.withDefaultDevice(.cpu) { () -> MLXArray in
+            Device.withDefaultDevice(encodeDevice) { () -> MLXArray in
                 let prevCacheLimit = Memory.cacheLimit
                 let capMB = ProcessInfo.processInfo.environment["VCU_CACHE_MB"].flatMap { Int($0) } ?? 2048
                 Memory.cacheLimit = capMB * 1_000_000
@@ -201,6 +208,7 @@ public final class VACEPipeline: @unchecked Sendable {
             }
         }
         vaceMemLog("VCU built (pre-denoise)")
+        WanDebug.stats("vcu (post-encode)", vcu)
         // Noise matches the VCU's latent geometry: [zDim, Tl, Hl, Wl].
         let (tLat, hLat, wLat) = (vcu.dim(1), vcu.dim(2), vcu.dim(3))
         if let seed { MLXRandom.seed(seed) }
@@ -218,8 +226,10 @@ public final class VACEPipeline: @unchecked Sendable {
         vaceMemLog("denoise done (pre-clearCache)")
         MLX.Memory.clearCache()  // drop the denoise working set before the decode
         vaceMemLog("post-denoise clearCache (pre-decode)")
+        WanDebug.stats("latent (pre-decode)", latent)
 
         let frames = WanProfiler.shared.region("phase", "decode") { decodeLatent(latent) }
+        WanDebug.stats("frames (post-decode)", frames)
         vaceMemLog("decode done")
         return frames
     }
@@ -298,8 +308,10 @@ public final class VACEPipeline: @unchecked Sendable {
         }
         vaceMemLog("denoise done (pre-decode)")
         MLX.Memory.clearCache()
+        WanDebug.stats("latent (pre-decode)", latent)
 
         let frames = WanProfiler.shared.region("phase", "decode") { decodeLatent(latent) }
+        WanDebug.stats("frames (post-decode)", frames)
         vaceMemLog("decode done")
         return frames
     }

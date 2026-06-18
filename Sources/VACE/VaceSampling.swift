@@ -73,6 +73,7 @@ public func denoiseVACE(
         }
         MLX.Memory.clearCache()  // per-step buffer-cache discipline
         vaceMemLog("denoise step \(i + 1)/\(steps)")  // E15: maps the memory climb to steps
+        WanDebug.stats("denoise step \(i + 1)/\(steps)", latents)  // WAN_DEBUG_STATS: latent divergence/zeroing
         try onStep?(i, steps, latents)
     }
     return latents
