@@ -18,9 +18,14 @@ enum FrameDecodeError: Error {
     case videoNoFrames
 }
 
-/// CGImage → top-down RGB float [3, H, W] in [-1, 1]. The CGContext is
-/// bottom-up, so we flip vertically to match PIL/top-down (a reference image
-/// fed upside-down would condition the wrong orientation).
+/// CGImage → RGB float [3, H, W] in [-1, 1], read row 0 = image top — matching
+/// the pipeline's decode/output convention (`FrameEncode` writes latent row 0 →
+/// video row 0, no flip; t2v output is correctly oriented). W8: a prior explicit
+/// vertical flip here (`translateBy(height)` + `scaleBy(y:-1)`) was the ONLY flip
+/// in the conditioned path, so i2v/v2v frames entered upside-down vs t2v/decode
+/// (operator-confirmed ground/sky swap, device-independent). Drawing the CGImage
+/// straight into this `premultipliedLast` context already yields the top-down
+/// raster the rest of the pipeline uses, so no flip is applied.
 private func rgbCHW(_ cg: CGImage, width: Int, height: Int) -> [Float] {
     var rgba = [UInt8](repeating: 0, count: width * height * 4)
     let ctx = CGContext(
@@ -28,9 +33,6 @@ private func rgbCHW(_ cg: CGImage, width: Int, height: Int) -> [Float] {
         bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
     ctx.interpolationQuality = .high  // ≈ bicubic, matching PIL.BICUBIC
-    // Flip to top-down: translate up then scale y by -1 before drawing.
-    ctx.translateBy(x: 0, y: CGFloat(height))
-    ctx.scaleBy(x: 1, y: -1)
     ctx.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
 
     var chw = [Float](repeating: 0, count: 3 * height * width)
