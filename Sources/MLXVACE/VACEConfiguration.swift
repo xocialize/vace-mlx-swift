@@ -10,7 +10,7 @@ import MLXToolKit
 ///   1. `modelDirectory` (a resolved flat dir: `model.safetensors` (backbone + vace_*) +
 ///      `vae.safetensors` + `t5_encoder.safetensors` + `config.json`)
 ///   2. HF download of `repo` into the local cache (`WeightLoader.snapshotDownload`)
-public struct VACEConfiguration: PackageConfiguration, ModelStorable {
+public struct VACEConfiguration: PackageConfiguration, ModelStorable, QuantConfigured {
     /// Published variant repo id (also the provenance source).
     public var repo: String
     public var revision: String?

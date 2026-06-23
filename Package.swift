@@ -25,7 +25,7 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
         // MLXEngine contract (MLXToolKit) for the wrapper target — the core `VACE` target
         // stays engine-agnostic.
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.4.0"),
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.9.1"),
         // The neutral Wan substrate (WanModel + 16-ch VAE + umT5 + RoPE + schedulers + loader).
         .package(path: "../wan-core-mlx-swift"),
     ],
