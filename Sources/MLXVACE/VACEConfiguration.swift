@@ -41,7 +41,25 @@ public struct VACEConfiguration: PackageConfiguration, ModelStorable, QuantConfi
         VACEConfiguration(quant: .int4)
     }
 
+    /// VACE-Fun-A14B (quality/pro tier): the dual-expert all-in-one control/editing model.
+    /// Same surface as the 1.3B consumer tier at A14B fidelity. The pipeline auto-detects the
+    /// dual-expert `high_noise_model/` + `low_noise_model/` checkpoint layout at `load()`.
+    public static var funA14B: VACEConfiguration {
+        VACEConfiguration(repo: "alibaba-pai/Wan2.2-VACE-Fun-A14B")
+    }
+
     private enum CodingKeys: String, CodingKey {
         case repo, revision, quant
     }
+}
+
+/// Cold-start weight prewarm (engine ≥0.7.0): page the resolved flat checkpoint into the OS file
+/// cache before `load()`'s GPU evals, so a cold load-time `eval` never faults weights off
+/// slow/external storage inside a live Metal command buffer (the cold-load GPU watchdog,
+/// `kIOGPUCommandBufferCallbackErrorTimeout`). VACE-1.3B is a light backbone (unlikely to bite),
+/// but the conformance is family-uniform. The whole resolved `modelDirectory` is paged; only the
+/// config knows the path, execution is the engine's (`WeightPrewarmer`, best-effort). Nil on the
+/// HF-download path → no-op.
+extension VACEConfiguration: WeightPrewarming {
+    public var prewarmPaths: [URL] { [modelDirectory].compactMap { $0 } }
 }
