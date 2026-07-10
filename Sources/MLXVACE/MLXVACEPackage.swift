@@ -105,84 +105,20 @@ public final class MLXVACEPackage: ModelPackage {
                 throw PackageError.configurationMismatch(
                     expected: "T2VRequest", got: String(describing: type(of: request)))
             }
-            return try await runT2V(t2v, pipeline: pipeline)
+            return try await runVACET2V(t2v, pipeline: pipeline)
         case .videoEdit:
             guard let vedit = request as? VEditRequest else {
                 throw PackageError.configurationMismatch(
                     expected: "VEditRequest", got: String(describing: type(of: request)))
             }
-            return try await runVideoEdit(vedit, pipeline: pipeline)
+            return try await runVACEVideoEdit(vedit, pipeline: pipeline)
         default:
             throw PackageError.unsupportedCapability(request.capability)
         }
     }
 
-    // MARK: - Surfaces
-
-    private func runT2V(_ request: T2VRequest, pipeline: VACEPipeline) async throws -> T2VResponse {
-        try Task.checkCancellation()
-        let numFrames = request.numFrames ?? 81
-        let fps = request.fps ?? 16
-        let width = request.width ?? 832
-        let height = request.height ?? 480
-        let steps = resolveSteps(mode: request.mode, steps: request.steps)
-        let onStep: (Int, Int, MLXArray) throws -> Void = { _, _, _ in
-            try Task.checkCancellation()  // C13: per-denoising-step cancellation
-        }
-
-        let frames: MLXArray
-        if let initImage = request.initImage {
-            // i2v: the init image is the (frozen) first frame. [1,3,1,H,W] → [3,H,W].
-            let image = try decodeReferencePixels(initImage, width: width, height: height)
-                .squeezed(axis: 0).squeezed(axis: 1)
-            frames = try pipeline.i2v(
-                image: image, prompt: request.prompt, negativePrompt: request.negativePrompt,
-                numFrames: numFrames, steps: steps, guideScale: request.guidanceScale,
-                seed: request.seed, onStep: onStep)
-        } else {
-            frames = try pipeline.t2v(
-                prompt: request.prompt, negativePrompt: request.negativePrompt,
-                width: width, height: height, numFrames: numFrames, steps: steps,
-                guideScale: request.guidanceScale, seed: request.seed, onStep: onStep)
-        }
-        return try await framesToVideoResponse(frames, fps: fps)
-    }
-
-    private func runVideoEdit(_ request: VEditRequest, pipeline: VACEPipeline) async throws
-        -> VEditResponse
-    {
-        try Task.checkCancellation()
-        let numFrames = request.numFrames ?? 81
-        let fps = request.fps ?? 16
-        let width = request.width ?? 832
-        let height = request.height ?? 480
-        let steps = resolveSteps(mode: request.mode, steps: request.steps)
-        let onStep: (Int, Int, MLXArray) throws -> Void = { _, _, _ in
-            try Task.checkCancellation()
-        }
-
-        // Source video → [3, T, H, W]; v2v = regenerate the whole clip (all-reactive mask).
-        let video = try await decodeVideoPixels(
-            request.video, width: width, height: height, numFrames: numFrames)
-            .squeezed(axis: 0)  // [3, T, H, W]
-        let t = video.dim(1)
-        let mask = MLXArray.ones([1, t, height, width])
-        let frames = try pipeline.generate(
-            prompt: request.prompt, negativePrompt: request.negativePrompt,
-            frames: video, mask: mask, steps: steps, guideScale: request.guidanceScale,
-            seed: request.seed, onStep: onStep)
-        let mp4 = try await encodeMP4(frames: frames, fps: fps)
-        return VEditResponse(
-            video: Video(format: .mp4, data: mp4,
-                         durationSeconds: Double(frames.dim(2)) / fps, frameRate: fps))
-    }
-
-    private func framesToVideoResponse(_ frames: MLXArray, fps: Double) async throws -> T2VResponse {
-        let mp4 = try await encodeMP4(frames: frames, fps: fps)
-        return T2VResponse(
-            video: Video(format: .mp4, data: mp4,
-                         durationSeconds: Double(frames.dim(2)) / fps, frameRate: fps))
-    }
+    // Surfaces run via the shared `runVACET2V` / `runVACEVideoEdit` functions (VACESurfaces.swift),
+    // reused by the dual-expert A14B package (`MLXVACEFunPackage`).
 }
 
 extension MLXVACEPackage {

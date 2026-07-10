@@ -34,8 +34,17 @@ func vaceMemLog(_ phase: String) {
 public final class VACEPipeline: @unchecked Sendable {
     public let config: WanConfig
     /// The VACE Context-Adapter DiT (`VaceWanModel`): the wan-core backbone + the
-    /// 15-layer parallel branch. Held resident (1.3B fp32 ≈ 8 GB — fits the tier).
+    /// parallel branch. For the dense 1.3B tier this is the sole expert; for the
+    /// dual-expert A14B tier (VACE-Fun) it is the HIGH-noise expert. Held resident.
     public let model: VaceWanModel
+    /// The LOW-noise expert (`VaceWanModel`) for the dual-expert A14B tier (VACE-Fun-A14B),
+    /// or `nil` for the single-expert 1.3B tier. When present, generation runs the dual-expert
+    /// denoise loop with the timestep-boundary switch (Bernini-A14B pattern). Both experts
+    /// carry their OWN VACE branch (per-expert, §3 of `ENH-vace-fun-a14b.md`).
+    /// NOTE (memory follow-up): both experts are held resident here (mirroring Bernini); the
+    /// quality/pro tier may move to SEQUENTIAL expert paging (one resident across the boundary)
+    /// when `residentBytes` is re-grounded on a measured phys (§5 of the scoping doc).
+    public let lowExpert: VaceWanModel?
     /// 16-ch WanVAE — encode (condition frames → z0) and decode (latent → frames).
     public let vae: WanVAE
     /// Checkpoint dir — kept so umT5 can be (re)loaded per request and evicted
@@ -44,12 +53,17 @@ public final class VACEPipeline: @unchecked Sendable {
     public let tokenizer: any Tokenizer
     public let vaceLayers: [Int]
 
+    /// True for the dual-expert A14B tier (VACE-Fun) — drives the boundary-switch denoise.
+    public var isDualExpert: Bool { lowExpert != nil }
+
     public init(
         config: WanConfig, model: VaceWanModel, vae: WanVAE,
-        modelDir: URL, tokenizer: any Tokenizer, vaceLayers: [Int]
+        modelDir: URL, tokenizer: any Tokenizer, vaceLayers: [Int],
+        lowExpert: VaceWanModel? = nil
     ) {
         self.config = config
         self.model = model
+        self.lowExpert = lowExpert
         self.vae = vae
         self.modelDir = modelDir
         self.tokenizer = tokenizer
@@ -67,24 +81,53 @@ public final class VACEPipeline: @unchecked Sendable {
     ) async throws -> VACEPipeline {
         let config = try WanConfig.load(
             from: modelDir.appendingPathComponent("config.json"))
-        // vace_layers = every other backbone layer ([0,2,…,28] for 30L = 15 injection points);
-        // vace_in_dim 96 = the VCU width. (Not in the reused backbone config.json — derived,
-        // matching the oracle + the parity tests.)
-        let vaceLayers = Array(stride(from: 0, to: config.numLayers, by: 2))
+        // vace_layers: the main-block indices that receive a branch hint. Read from config.json
+        // when present (the released VACE checkpoints carry it — 1.3B `[0,2,…,28]`=15 over 30L,
+        // A14B `[0,5,…,35]`=8 over 40L); fall back to the 1.3B every-other rule otherwise.
+        // vace_in_dim 96 = the VCU width.
+        let configURL = modelDir.appendingPathComponent("config.json")
+        let vaceLayers = (try? readVaceLayers(from: configURL))
+            ?? Array(stride(from: 0, to: config.numLayers, by: 2))
 
         // Self-certifying config line (E15): prove from the console WHICH path this process
         // actually took — "set in the scheme" ≠ "engaged in this run". Covers the experiment
         // knobs (DiT dtype + the fp32-SDPA upcast) and the memory caps. The runtime analog of
         // the artifact/label check, for config the binary can't reveal statically.
         let env = ProcessInfo.processInfo.environment
-        print("[VACE config] ditDType=\(ditDType) "
+        let fm = FileManager.default
+        // Dual-expert (VACE-Fun-A14B) layout: per-expert subdirs `high_noise_model/` +
+        // `low_noise_model/` (each `model.safetensors`), shared `vae.safetensors` +
+        // `t5_encoder.safetensors` + `config.json` at top level. Single-expert (1.3B): flat.
+        let highDir = modelDir.appendingPathComponent("high_noise_model")
+        let lowDir = modelDir.appendingPathComponent("low_noise_model")
+        let isDual = config.dualModel
+            && fm.fileExists(atPath: highDir.appendingPathComponent("model.safetensors").path)
+            && fm.fileExists(atPath: lowDir.appendingPathComponent("model.safetensors").path)
+        print("[VACE config] ditDType=\(ditDType) dual=\(isDual) "
+            + "vaceLayers=\(vaceLayers.count) (\(vaceLayers.first ?? -1)…\(vaceLayers.last ?? -1)) "
+            + "boundary=\(config.boundary) guide=\(config.sampleGuideScale) "
             + "WAN_FP32_SDPA=\(wanForceFp32SdpaLargeSeq ? 1 : 0) (wanLargeSeq=\(wanLargeSeq)) "
             + "DENOISE_CACHE_MB=\(env["DENOISE_CACHE_MB"] ?? "2048") "
             + "DECODE_CACHE_MB=\(env["DECODE_CACHE_MB"] ?? "2048")")
 
-        let model = try loadDiT(
-            modelDir: modelDir, config: config, vaceLayers: vaceLayers, ditDType: ditDType)
-        vaceMemLog("DiT loaded")
+        let model: VaceWanModel
+        var lowExpert: VaceWanModel? = nil
+        if isDual {
+            // Each expert dir ships its OWN complete VaceWanModel (backbone + 8-layer branch).
+            model = try loadDiT(
+                weightsURL: highDir.appendingPathComponent("model.safetensors"),
+                config: config, vaceLayers: vaceLayers, ditDType: ditDType)
+            vaceMemLog("high-noise expert loaded")
+            lowExpert = try loadDiT(
+                weightsURL: lowDir.appendingPathComponent("model.safetensors"),
+                config: config, vaceLayers: vaceLayers, ditDType: ditDType)
+            vaceMemLog("low-noise expert loaded")
+        } else {
+            model = try loadDiT(
+                weightsURL: modelDir.appendingPathComponent("model.safetensors"),
+                config: config, vaceLayers: vaceLayers, ditDType: ditDType)
+            vaceMemLog("DiT loaded")
+        }
 
         // 16-ch WanVAE (encoder + decoder), fp32 on the CPU stream (parity + watchdog).
         let vae = WanVAE(zDim: config.vaeZDim, encoder: true)
@@ -100,17 +143,31 @@ public final class VACEPipeline: @unchecked Sendable {
         let tokenizer = try await AutoTokenizer.from(pretrained: umt5TokenizerRepo)
         return VACEPipeline(
             config: config, model: model, vae: vae,
-            modelDir: modelDir, tokenizer: tokenizer, vaceLayers: vaceLayers)
+            modelDir: modelDir, tokenizer: tokenizer, vaceLayers: vaceLayers,
+            lowExpert: lowExpert)
     }
 
-    /// Build + load the VACE DiT (fp32 compute for video-scale correctness). Drops a
-    /// stray `freqs` table if present (the precomputed RoPE table is rebuilt in-model).
+    /// Read the optional `vace_layers` array from a checkpoint `config.json`. The released
+    /// VACE configs carry it (1.3B 15-entry, A14B 8-entry `[0,5,…,35]`); absent → caller
+    /// falls back to the every-other rule. Robust to Int/Double JSON encodings.
+    static func readVaceLayers(from configURL: URL) throws -> [Int] {
+        let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: configURL))
+        guard let dict = obj as? [String: Any],
+              let raw = dict["vace_layers"] as? [Any]
+        else { throw VACELoadError.vaceLayersMissing }
+        let layers = raw.compactMap { ($0 as? Int) ?? ($0 as? Double).map(Int.init) }
+        guard layers.count == raw.count, !layers.isEmpty else { throw VACELoadError.vaceLayersMissing }
+        return layers
+    }
+
+    /// Build + load one VACE DiT expert from its `model.safetensors` (fp32 compute for
+    /// video-scale correctness). Drops a stray `freqs` table if present (the precomputed
+    /// RoPE table is rebuilt in-model).
     static func loadDiT(
-        modelDir: URL, config: WanConfig, vaceLayers: [Int], ditDType: DType
+        weightsURL: URL, config: WanConfig, vaceLayers: [Int], ditDType: DType
     ) throws -> VaceWanModel {
         let model = VaceWanModel(config: config, vaceLayers: vaceLayers, vaceInDim: 96)
-        var weights = try WeightLoader.loadSafetensors(
-            url: modelDir.appendingPathComponent("model.safetensors"))
+        var weights = try WeightLoader.loadSafetensors(url: weightsURL)
         weights = weights.filter { $0.key != "freqs" }
         // Cast to the requested compute dtype (fp32 default; .bfloat16 for the E15 bf16-fused
         // experiment — mirrors mlx-video, which runs the DiT in bf16 with fp32-internal softmax).
@@ -144,6 +201,31 @@ public final class VACEPipeline: @unchecked Sendable {
         encoder = nil
         MLX.Memory.clearCache()
         return result
+    }
+
+    // MARK: - Denoise dispatch (single 1.3B expert vs dual A14B experts)
+
+    /// Route the denoise to the single-expert loop (1.3B) or the dual-expert boundary-switch
+    /// loop (VACE-Fun-A14B), transparently to the mode methods. `vaceContext: nil` = base t2v
+    /// (no control branch). The two loops share the FlowUniPC scheduler + CFG wiring; the dual
+    /// loop adds the timestep-boundary expert switch (Bernini-A14B pattern).
+    func denoiseDispatch(
+        contextCond: MLXArray, contextNull: MLXArray, vaceContext: MLXArray?, noise: MLXArray,
+        steps: Int, guideScale: Double?, vaceContextScale: Float,
+        onStep: ((Int, Int, MLXArray) throws -> Void)?
+    ) throws -> MLXArray {
+        if let low = lowExpert {
+            return try denoiseVACEDualExpert(
+                high: model, low: low, config: config, contextCond: contextCond,
+                contextNull: contextNull, vaceContext: vaceContext, noise: noise, steps: steps,
+                shift: config.sampleShift, guideScaleOverride: guideScale,
+                vaceContextScale: vaceContextScale, onStep: onStep)
+        }
+        return try denoiseVACE(
+            model: model, config: config, contextCond: contextCond, contextNull: contextNull,
+            vaceContext: vaceContext, noise: noise, steps: steps, shift: config.sampleShift,
+            guideScale: guideScale ?? (config.sampleGuideScale.first ?? 5.0),
+            vaceContextScale: vaceContextScale, onStep: onStep)
     }
 
     // MARK: - Generation
@@ -215,10 +297,9 @@ public final class VACEPipeline: @unchecked Sendable {
         let noise = MLXRandom.normal([config.vaeZDim, tLat, hLat, wLat])
 
         let latent = try WanProfiler.shared.region("phase", "denoise") {
-            let l = try denoiseVACE(
-                model: model, config: config, contextCond: contextCond, contextNull: contextNull,
-                vaceContext: vcu, noise: noise, steps: steps ?? config.sampleSteps,
-                shift: config.sampleShift, guideScale: guideScale ?? (config.sampleGuideScale.first ?? 5.0),
+            let l = try denoiseDispatch(
+                contextCond: contextCond, contextNull: contextNull, vaceContext: vcu, noise: noise,
+                steps: steps ?? config.sampleSteps, guideScale: guideScale,
                 vaceContextScale: vaceContextScale, onStep: onStep)
             eval(l)
             return l
@@ -298,11 +379,10 @@ public final class VACEPipeline: @unchecked Sendable {
         let noise = MLXRandom.normal([config.vaeZDim, tLat, hLat, wLat])
 
         let latent = try WanProfiler.shared.region("phase", "denoise") {
-            let l = try denoiseVACE(
-                model: model, config: config, contextCond: contextCond, contextNull: contextNull,
-                vaceContext: nil, noise: noise, steps: steps ?? config.sampleSteps,
-                shift: config.sampleShift, guideScale: guideScale ?? (config.sampleGuideScale.first ?? 5.0),
-                onStep: onStep)
+            let l = try denoiseDispatch(
+                contextCond: contextCond, contextNull: contextNull, vaceContext: nil, noise: noise,
+                steps: steps ?? config.sampleSteps, guideScale: guideScale,
+                vaceContextScale: 1.0, onStep: onStep)
             eval(l)
             return l
         }
@@ -348,4 +428,10 @@ public final class VACEPipeline: @unchecked Sendable {
             prompt: prompt, negativePrompt: negativePrompt, frames: video, mask: mask,
             steps: steps, guideScale: guideScale, seed: seed, onStep: onStep)
     }
+}
+
+/// Checkpoint-loading errors specific to the VACE pipeline.
+public enum VACELoadError: Error {
+    /// `vace_layers` absent or malformed in `config.json` — the caller falls back to a rule.
+    case vaceLayersMissing
 }
