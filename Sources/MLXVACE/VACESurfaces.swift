@@ -40,6 +40,9 @@ func runVACET2V(_ request: T2VRequest, pipeline: VACEPipeline) async throws -> T
             width: width, height: height, numFrames: numFrames, steps: steps,
             guideScale: request.guidanceScale, seed: request.seed, onStep: onStep)
     }
+    // Post-core checkpoint: the streaming VAE decode bails per temporal chunk
+    // (non-throwing) — discard a truncated result and rethrow here.
+    try Task.checkCancellation()
     return try await framesToVACEVideoResponse(frames, fps: fps)
 }
 
@@ -65,6 +68,10 @@ func runVACEVideoEdit(_ request: VEditRequest, pipeline: VACEPipeline) async thr
         prompt: request.prompt, negativePrompt: request.negativePrompt,
         frames: video, mask: mask, steps: steps, guideScale: request.guidanceScale,
         seed: request.seed, onStep: onStep)
+    // Post-core checkpoint: the streaming VAE decode bails per temporal chunk
+    // (non-throwing) — discard a truncated result and rethrow here. (The VCU build's
+    // encodeStreaming also bails per chunk; the pipeline throws through onStep.)
+    try Task.checkCancellation()
     let mp4 = try await encodeMP4(frames: frames, fps: fps)
     return VEditResponse(
         video: Video(format: .mp4, data: mp4,

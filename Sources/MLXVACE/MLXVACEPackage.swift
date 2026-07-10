@@ -98,6 +98,9 @@ public final class MLXVACEPackage: ModelPackage {
     }
 
     public func run(_ request: any CapabilityRequest) async throws -> any CapabilityResponse {
+        // CAN-1: the entry checkpoint is the FIRST act of run() — before the notLoaded
+        // guard, capability validation, or dispatch (run-lifecycle program, engine 0.27.0).
+        try Task.checkCancellation()
         guard let pipeline else { throw PackageError.notLoaded }
         switch request.capability {
         case .textToVideo:

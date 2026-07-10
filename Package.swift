@@ -23,9 +23,10 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
-        // MLXEngine contract (MLXToolKit) for the wrapper target — the core `VACE` target
-        // stays engine-agnostic.
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.9.1"),
+        // MLXEngine contract (MLXToolKit) for the wrapper target; ≥0.27.0 for the CAN
+        // cancellation gate (MLXServeConformance.CancellationConformance). The core
+        // `VACE` target stays engine-agnostic.
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.27.0"),
         // The neutral Wan substrate (WanModel + 16-ch VAE + umT5 + RoPE + schedulers + loader).
         .package(path: "../wan-core-mlx-swift"),
     ],
@@ -68,6 +69,15 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
             ],
             path: "Tests/VACETests"
+        ),
+        // Wrapper conformance (offline): the CAN cancellation gate (both tiers).
+        .testTarget(
+            name: "MLXVACETests",
+            dependencies: [
+                "MLXVACE",
+                .product(name: "MLXServeConformance", package: "mlx-engine-swift"),
+            ],
+            path: "Tests/MLXVACETests"
         ),
     ]
 )
