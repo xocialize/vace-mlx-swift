@@ -1,5 +1,5 @@
 {
-  "originHash" : "cb952a7a63d115d9d7e1659eb1852e226e31b7e6b1480fab65d24397f290d6c9",
+  "originHash" : "6b8f54d0c925550a9ce04364a17c5baa13b6531173ebf13b00a4cc8af23790d3",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/xocialize/mlx-block-stream-swift",
       "state" : {
-        "revision" : "5df6d7337135394ea27e9b3f7879bfc06d4c3700",
-        "version" : "0.5.0"
+        "revision" : "6439cc090ebf94692a2b1cb0175699015780edd0",
+        "version" : "0.5.1"
       }
     },
     {
@@ -33,17 +33,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/ml-explore/mlx-swift.git",
       "state" : {
-        "revision" : "0bb916c67f4b9e5c682cbe02a42c701c93ab5021",
-        "version" : "0.31.6"
-      }
-    },
-    {
-      "identity" : "swift-argument-parser",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/apple/swift-argument-parser",
-      "state" : {
-        "revision" : "6a52f3251125d74daf04fcbd5e6f08a75d074382",
-        "version" : "1.8.2"
+        "revision" : "19601207e9a0de51e03ee6ec0c3c5f3784275075",
+        "version" : "0.32.3"
       }
     },
     {
@@ -141,8 +132,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/xocialize/wan-core-mlx-swift",
       "state" : {
-        "revision" : "1fd068acdab635062691555bec32536ed69e7609",
-        "version" : "0.2.0"
+        "revision" : "a7632c30a81e6e5d40e6f11c02b3b85d7e906271",
+        "version" : "0.3.0"
       }
     },
     {

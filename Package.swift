@@ -22,13 +22,13 @@ let package = Package(
         .executable(name: "RunVACE", targets: ["RunVACE"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
+        .package(url: "https://github.com/ml-explore/mlx-swift.git", "0.32.3"..<"0.33.0"),  // NAX split-K fix (AB-R-0778)
         // MLXEngine contract (MLXToolKit) for the wrapper target; ≥0.27.0 for the CAN
         // cancellation gate (MLXServeConformance.CancellationConformance). The core
         // `VACE` target stays engine-agnostic.
         .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.27.0"),
         // The neutral Wan substrate (WanModel + 16-ch VAE + umT5 + RoPE + schedulers + loader).
-        .package(url: "https://github.com/xocialize/wan-core-mlx-swift", from: "0.2.0"),
+        .package(url: "https://github.com/xocialize/wan-core-mlx-swift", from: "0.3.0"),
     ],
     targets: [
         .target(
